@@ -17,6 +17,8 @@ When the initial bounded wait for file-backed SQLite rollback or close expires, 
 
 A successful-completion warning MUST name phase, initial bound and elapsed time measured before grace. Teardown failure and invalidation failure MUST be reported at warning level. Diagnostics MUST describe reclamation as attempted and failed writer release as unconfirmed; logical connection closure MUST NOT be treated as proof that no native cursor remains. Finalization diagnostics MUST report task completion without asserting completion occurred after reclamation.
 
+An observed teardown exception after grace MUST be reported once at warning level with phase, initial bound, elapsed time and the observed error, regardless of whether captured handles are open or closed. A bounded shutdown drain with outstanding cleanup tasks MUST warn with the pending task count and describe connection reclamation and writer-slot release as unconfirmed.
+
 #### Scenario: Native worker completes while loop callbacks are delayed
 
 - **GIVEN** native file-backed SQLite rollback or close completes while the event loop is blocked across the initial bound
@@ -41,3 +43,17 @@ A successful-completion warning MUST name phase, initial bound and elapsed time 
 - **WHEN** invalidation of a captured open connection raises
 - **THEN** the failure is reported at warning level with writer-slot release unconfirmed
 - **AND** the original teardown remains owned
+
+#### Scenario: Shutdown follows refused invalidation with a retained writer
+
+- **GIVEN** driver rollback remains pending and captured-connection invalidation fails
+- **WHEN** the bounded shutdown drain expires while an independent writer is still refused with database is locked
+- **THEN** the warning names the outstanding task count and reports reclamation and writer-slot release as unconfirmed
+- **AND** original and follow-up cleanup retain ownership and permit the peer to commit after rollback is released
+
+#### Scenario: Grace observes an exception with an open captured handle
+
+- **GIVEN** a rollback exception is released when the grace observer begins and the captured handle is open
+- **WHEN** grace observes the failed teardown
+- **THEN** the observed error is reported once at warning level with phase, bound and elapsed time
+- **AND** fencing, reclamation attempts and owned follow-up cleanup still run

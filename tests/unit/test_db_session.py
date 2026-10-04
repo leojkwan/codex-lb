@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -1698,25 +1699,75 @@ async def test_close_db_drains_a_pending_reclaimed_rollback_and_its_bookkeeping_
 
 
 @pytest.mark.asyncio
-async def test_close_db_bounds_the_wedged_teardown_drain(monkeypatch, caplog) -> None:
-    """A teardown that stays wedged despite the reclaim (the interrupt is
-    best-effort) must not wedge shutdown too: the registry drain is explicitly
-    bounded and abandons whatever remains after the deadline."""
-    monkeypatch.setattr(session_module, "_SQLITE_TEARDOWN_TIMEOUT_SECONDS", 0.05)
-    never = asyncio.Event()
-    stuck: asyncio.Task[bool] = asyncio.ensure_future(never.wait())
-    session_module._wedged_teardown_cleanup_tasks.add(stuck)
+async def test_close_db_bounds_the_wedged_teardown_drain(tmp_path, monkeypatch, caplog) -> None:
+    """Refused invalidation can leave a real writer locked after bounded shutdown.
+    The warning must report pending ownership without claiming reclamation."""
+    monkeypatch.setattr(session_module, "_SQLITE_TEARDOWN_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(session_module, "_SQLITE_TEARDOWN_COMPLETION_GRACE_SECONDS", 0.05)
+    db_path = tmp_path / "refused-invalidation.db"
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{db_path}", poolclass=NullPool, connect_args={"timeout": 0.05}
+    )
+    monkeypatch.setattr(session_module, "engine", engine)
+    monkeypatch.setattr(session_module, "_background_engine", None)
+    async with engine.begin() as connection:
+        await connection.execute(sa_text("CREATE TABLE teardown_probe (value INTEGER)"))
+    session = async_sessionmaker(engine)()
+    await session.execute(sa_text("INSERT INTO teardown_probe VALUES (1)"))
+    held = session_module._session_sync_connections(session)
+    assert len(held) == 1
+    sync_connection = held[0]
+    driver = sync_connection.connection.driver_connection
+    assert driver is not None
+    original_rollback = driver.rollback
+    original_invalidate = sync_connection.invalidate
+    release = asyncio.Event()
+
+    async def _blocked_rollback() -> None:
+        await release.wait()
+        await original_rollback()
+
+    def _refused_invalidation(*args, **kwargs) -> None:
+        raise RuntimeError("probe_invalidate_refusal")
+
+    def _peer_insert() -> list[tuple[int]]:
+        with contextlib.closing(sqlite3.connect(db_path, timeout=0.05)) as peer:
+            peer.execute("INSERT INTO teardown_probe VALUES (2)")
+            peer.commit()
+            return peer.execute("SELECT value FROM teardown_probe ORDER BY value").fetchall()
+
+    monkeypatch.setattr(driver, "rollback", _blocked_rollback)
+    monkeypatch.setattr(sync_connection, "invalidate", _refused_invalidation)
     try:
         with caplog.at_level(logging.WARNING, logger=session_module.__name__):
+            await asyncio.wait_for(session_module._safe_rollback(session), timeout=2.0)
             await asyncio.wait_for(session_module.close_db(), timeout=2.0)
-        assert any("still-pending wedged-teardown" in record.getMessage() for record in caplog.records), (
-            "the bounded drain must report what it abandoned"
-        )
-        assert stuck in session_module._wedged_teardown_cleanup_tasks
+        assert len(session_module._wedged_teardown_cleanup_tasks) == 1
+        assert not sync_connection.closed and not sync_connection.invalidated
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            await asyncio.to_thread(_peer_insert)
+        drain_warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING and "still-pending wedged-teardown" in record.getMessage()
+        ]
+        assert len(drain_warnings) == 1, "the bounded drain must visibly report pending work"
+        assert "abandoned 1 still-pending" in drain_warnings[0]
+        assert "reclamation and writer-slot release remain unconfirmed" in drain_warnings[0]
+        assert "connections were already reclaimed" not in drain_warnings[0]
     finally:
-        session_module._wedged_teardown_cleanup_tasks.discard(stuck)
-        never.set()
-        await stuck
+        monkeypatch.setattr(sync_connection, "invalidate", original_invalidate)
+        monkeypatch.setattr(driver, "rollback", original_rollback)
+        release.set()
+        for _ in range(4):
+            pending = tuple(session_module._wedged_teardown_cleanup_tasks)
+            if pending:
+                await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=2.0)
+            await asyncio.sleep(0)
+        await session.close()
+        await engine.dispose()
+    assert not session_module._wedged_teardown_cleanup_tasks
+    assert await asyncio.to_thread(_peer_insert) == [(2,)]
 
 
 @pytest.mark.parametrize("loop_name", ["asyncio", "uvloop"])
@@ -1931,7 +1982,7 @@ async def test_reclaim_still_runs_when_the_late_teardown_did_not_succeed(
     SQLAlchemy clears ``session._transaction`` before releasing every held
     connection — so only a successful completion earns the exemption; anything
     else keeps the issue #1682 reclaim."""
-    monkeypatch.setattr(session_module, "_SQLITE_TEARDOWN_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(session_module, "_SQLITE_TEARDOWN_TIMEOUT_SECONDS", 0.02)
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{tmp_path / f'late-{outcome}.db'}",
         poolclass=NullPool,
@@ -1939,7 +1990,6 @@ async def test_reclaim_still_runs_when_the_late_teardown_did_not_succeed(
     )
     session_module._configure_sqlite_engine(engine.sync_engine, enable_wal=True)
     release_wedge = asyncio.Event()
-    timer: threading.Timer | None = None
     try:
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
@@ -1952,27 +2002,23 @@ async def test_reclaim_still_runs_when_the_late_teardown_did_not_succeed(
         assert held, "the open write transaction must expose its sync connection"
         sync_connection = held[0]
 
-        entered = threading.Event()
-
         async def _failing_rollback() -> None:
-            entered.set()
             await release_wedge.wait()
             if outcome == "exception":
                 raise RuntimeError("rollback failed after the bound")
             raise asyncio.CancelledError()
 
         monkeypatch.setattr(session, "rollback", _failing_rollback)
+        original_grace = session_module._teardown_completed_after_bound
 
-        loop = asyncio.get_running_loop()
+        async def _observed_grace(task: asyncio.Task[object]) -> bool:
+            assert not sync_connection.closed, "the late failure must be observed with an open handle"
+            asyncio.get_running_loop().call_soon(release_wedge.set)
+            return await original_grace(task)
+
+        monkeypatch.setattr(session_module, "_teardown_completed_after_bound", _observed_grace)
         with caplog.at_level(logging.INFO, logger=session_module.__name__):
-            rollback_task = asyncio.ensure_future(session_module._safe_rollback(session))
-            await _wait_until(entered.is_set)
-            timer = threading.Timer(0.35, lambda: loop.call_soon_threadsafe(release_wedge.set))
-            timer.start()
-            time.sleep(0.3)
-            done, _ = await asyncio.wait({rollback_task}, timeout=3.0)
-            assert done, "_safe_rollback must be bounded"
-            rollback_task.result()
+            await asyncio.wait_for(session_module._safe_rollback(session), timeout=3.0)
 
         assert sync_connection.invalidated or sync_connection.closed, (
             "a teardown that failed or was cancelled must still have its connection reclaimed"
@@ -1986,14 +2032,25 @@ async def test_reclaim_still_runs_when_the_late_teardown_did_not_succeed(
         assert not any(
             "sqlite_teardown_bound_elapsed_but_completed" in record.getMessage() for record in caplog.records
         ), "an unsuccessful teardown must not be reported as completed"
+        failures = [
+            record
+            for record in caplog.records
+            if record.levelno == logging.WARNING and "rollback failed after the bound" in record.getMessage()
+        ]
+        assert len(failures) == (1 if outcome == "exception" else 0), (
+            "the observed exception must be reported once at warning level"
+        )
+        if failures:
+            message = failures[0].getMessage()
+            assert "phase=rollback" in message and "bound_seconds=" in message and "elapsed_seconds=" in message
 
-        pending_cleanup = tuple(session_module._wedged_teardown_cleanup_tasks)
-        if pending_cleanup:
-            await asyncio.wait_for(asyncio.gather(*pending_cleanup, return_exceptions=True), timeout=2.0)
-        session_module._wedged_teardown_cleanup_tasks.clear()
+        for _ in range(4):
+            pending_cleanup = tuple(session_module._wedged_teardown_cleanup_tasks)
+            if pending_cleanup:
+                await asyncio.wait_for(asyncio.gather(*pending_cleanup, return_exceptions=True), timeout=2.0)
+            await asyncio.sleep(0)
+        assert not session_module._wedged_teardown_cleanup_tasks
     finally:
-        if timer is not None:
-            timer.cancel()
         release_wedge.set()
         await asyncio.sleep(0.05)
         await engine.dispose()
@@ -2041,10 +2098,11 @@ async def test_reclaim_skips_a_connection_the_failed_teardown_already_closed(tmp
         assert not any("connection interruption and invalidation" in message for message in warnings), (
             "a released connection must not be reported as a reclaim"
         )
-        released = [message for message in warnings if "failed after closing its logical connection" in message]
+        released = [message for message in warnings if "rollback raised after the connection was released" in message]
         assert len(released) == 1, "the failure that ended the teardown must still be reported"
         assert "rollback raised after the connection was released" in released[0]
         assert "phase=rollback" in released[0] and "elapsed_seconds=6.0" in released[0]
+        assert "bound_seconds=" in released[0]
         assert session.info.get(session_module._SQLITE_TEARDOWN_WEDGED_INFO_KEY) is True, (
             "the session is still fenced: its teardown did not complete successfully"
         )
@@ -2057,6 +2115,7 @@ async def test_reclaim_skips_a_connection_the_failed_teardown_already_closed(tmp
             await asyncio.sleep(0)
         assert not session_module._wedged_teardown_cleanup_tasks
         messages = [record.getMessage() for record in caplog.records]
+        assert any("skipping the closed handle" in message for message in messages)
         assert "SQLite teardown task finished phase=rollback" in messages
         assert not any("finished late" in message for message in messages), (
             "a task already terminal during grace must not be reported as finishing after reclamation"

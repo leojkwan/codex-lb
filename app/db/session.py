@@ -590,30 +590,28 @@ async def _reclaim_wedged_sqlite_session(
     # reclamation attempts below, so the deferred bookkeeping close follows
     # those attempts and completion of the original teardown.
     _wedged_teardown_cleanup_tasks.add(abandoned)
+    # Report an observed failure once, regardless of captured-handle state.
+    # The finalizer consumes expected errors after reclamation as well.
+    failure = abandoned.exception() if abandoned.done() and not abandoned.cancelled() else None
+    if failure is not None:
+        logger.warning(
+            "sqlite_wedged_teardown phase=%s bound_seconds=%.1f elapsed_seconds=%.1f; the %s failed: %r",
+            phase,
+            _SQLITE_TEARDOWN_TIMEOUT_SECONDS,
+            elapsed_seconds,
+            phase,
+            failure,
+        )
     for connection in connections:
         if connection.closed:
             # The teardown closed this logical handle before failure or
             # cancellation. That does not prove no native cursor remains.
-            # Skip the unusable handle, but report the teardown failure that
-            # ``_finish_abandoned_teardown`` otherwise consumes.
-            failure = abandoned.exception() if abandoned.done() and not abandoned.cancelled() else None
-            if failure is not None:
-                logger.warning(
-                    "sqlite_wedged_teardown phase=%s bound_seconds=%.1f elapsed_seconds=%.1f; the %s failed "
-                    "after closing its logical connection; skipping the closed handle: %r",
-                    phase,
-                    _SQLITE_TEARDOWN_TIMEOUT_SECONDS,
-                    elapsed_seconds,
-                    phase,
-                    failure,
-                )
-            else:
-                logger.debug(
-                    "sqlite_wedged_teardown phase=%s; the abandoned %s already closed its logical connection; "
-                    "skipping the closed handle",
-                    phase,
-                    phase,
-                )
+            logger.debug(
+                "sqlite_wedged_teardown phase=%s; the abandoned %s already closed its logical connection; "
+                "skipping the closed handle",
+                phase,
+                phase,
+            )
             continue
         logger.warning(
             "sqlite_wedged_teardown phase=%s bound_seconds=%.1f elapsed_seconds=%.1f %s; attempting "
@@ -1055,7 +1053,7 @@ async def close_db() -> None:
             if remaining <= 0:
                 logger.warning(
                     "close_db abandoned %d still-pending wedged-teardown task(s) after the bounded "
-                    "drain; their connections were already reclaimed (issue #1682)",
+                    "drain; connection reclamation and writer-slot release remain unconfirmed (issue #1682)",
                     len(_wedged_teardown_cleanup_tasks),
                 )
                 break
