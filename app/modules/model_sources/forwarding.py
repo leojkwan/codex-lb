@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from contextlib import AbstractContextManager, AsyncExitStack, nullcontext
+from contextlib import AbstractContextManager, AsyncExitStack, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from json import JSONDecodeError
 from math import isfinite
@@ -18,6 +18,11 @@ from app.core.config.dashboard_overrides import with_dashboard_overrides
 from app.core.config.settings import get_settings
 from app.core.crypto import TokenEncryptor
 from app.core.openai.parsing import classify_event_type
+from app.core.resilience.model_source_admission import (
+    ModelSourceAdmission,
+    ModelSourceAdmissionError,
+    is_capped_request,
+)
 from app.core.types import JsonValue
 from app.core.utils.json_guards import is_json_mapping
 from app.core.utils.shared_future import (
@@ -265,6 +270,14 @@ async def _await_result_deferring_cancellation(
     return await _shared_await_cleanup_deferring_cancellation(awaitable, scheduler=scheduler) is not None
 
 
+class SourceRequestExitStack(AsyncExitStack):
+    """Keep admission with the existing stream's transport ownership."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.admission: ModelSourceAdmission | None = None
+
+
 class SourceStreamTransport:
     """Single close latch for the exit stack that owns a source stream (session lease + response).
 
@@ -277,17 +290,50 @@ class SourceStreamTransport:
     the pooled lease.
     """
 
-    __slots__ = ("_close_task", "_scheduler", "_stack")
+    __slots__ = ("_admission", "_close_task", "_scheduler", "_stack")
 
     def __init__(self, stack: AsyncExitStack, *, scheduler: Scheduler) -> None:
         self._stack = stack
         self._scheduler = scheduler
         self._close_task: asyncio.Task[None] | None = None
+        self._admission = stack.admission if isinstance(stack, SourceRequestExitStack) else None
+
+    def mark_body_received(self) -> None:
+        if self._admission is not None:
+            self._admission.mark_body_received(streaming=True)
 
     async def aclose(self) -> None:
         if self._close_task is None:
             self._close_task = self._scheduler.create_task(self._stack.aclose())
         await _await_task_deferring_cancellation(self._close_task)
+
+
+@asynccontextmanager
+async def _source_admission(source: ModelSource, payload: dict[str, JsonValue], encryptor: TokenEncryptor | None):
+    model = payload.get("model")
+    if not isinstance(model, str) or not is_capped_request(source.base_url, model):
+        yield None
+        return
+    try:
+        settings = get_settings()
+        admission = ModelSourceAdmission.for_request(
+            base_url=source.base_url,
+            model=model if isinstance(model, str) else "",
+            credential=_source_api_key_secret(source, encryptor=encryptor),
+            data_dir=settings.data_dir,
+            wait_seconds=settings.proxy_admission_wait_timeout_seconds,
+        )
+        if admission is None:
+            yield None
+            return
+        async with admission:
+            yield admission
+    except ModelSourceAdmissionError as exc:
+        raise ModelSourceForwardingError(
+            status_code=503,
+            payload={"error": {"type": "local_overload", "code": "model_source_concurrency_full", "message": str(exc)}},
+            retry_after="1",
+        ) from exc
 
 
 async def forward_chat_completion(
@@ -298,6 +344,7 @@ async def forward_chat_completion(
 ) -> SourceChatCompletion:
     stack = AsyncExitStack()
     try:
+        admission = await stack.enter_async_context(_source_admission(source, payload, encryptor))
         session = await stack.enter_async_context(lease_model_source_session())
         response = await stack.enter_async_context(
             session.post(
@@ -307,6 +354,8 @@ async def forward_chat_completion(
                 timeout=_source_client_timeout(source),
             )
         )
+        if admission is not None:
+            admission.observe_response(response.status, response.headers)
         data = await _response_json(response)
         if response.status >= 400:
             raise _upstream_status_error(response, source, encryptor=encryptor, error_payload=_error_payload(data))
@@ -318,6 +367,8 @@ async def forward_chat_completion(
             timings=_timings_from_payload(data),
             upstream_status_code=response.status,
         )
+        if admission is not None:
+            admission.mark_body_received()
     except (aiohttp.ClientError, TimeoutError) as exc:
         await _await_cleanup_deferring_cancellation(stack.aclose())
         raise _unreachable_error(exc) from exc
@@ -387,35 +438,48 @@ async def forward_responses(
     encryptor: TokenEncryptor | None = None,
     recode_credential_failures: bool = True,
 ) -> SourceResponsesCompletion:
+    stack = AsyncExitStack()
     try:
-        async with lease_model_source_session() as session:
-            # Non-stream generations legitimately spend minutes before the
-            # first byte, so only connect establishment and the source's total
-            # budget are bounded here (no header/first-frame deadline).
-            async with session.post(
+        admission = await stack.enter_async_context(_source_admission(source, payload, encryptor))
+        session = await stack.enter_async_context(lease_model_source_session())
+        # Non-stream generations use the source's total budget, as before.
+        response = await stack.enter_async_context(
+            session.post(
                 _source_url(source, "/responses"),
                 headers=_source_headers(source, encryptor=encryptor),
                 json=payload,
                 timeout=_source_client_timeout(source),
-            ) as response:
-                if response.status >= 400:
-                    if recode_credential_failures and response.status in _CREDENTIAL_REJECTION_STATUSES:
-                        raise _credentials_rejected_error(response, source)
-                    data = await _response_json(response)
-                    raise _upstream_status_error(
-                        response, source, encryptor=encryptor, error_payload=_error_payload(data)
-                    )
-                data = await _response_json(response)
-                if data is None:
-                    raise _invalid_upstream_response_error(response.status)
-                return SourceResponsesCompletion(
-                    payload=data,
-                    usage=_usage_from_responses_payload(data),
-                    timings=_timings_from_payload(data),
-                    upstream_status_code=response.status,
-                )
+            )
+        )
+        if admission is not None:
+            admission.observe_response(response.status, response.headers)
+        if response.status >= 400:
+            if recode_credential_failures and response.status in _CREDENTIAL_REJECTION_STATUSES:
+                raise _credentials_rejected_error(response, source)
+            data = await _response_json(response)
+            raise _upstream_status_error(response, source, encryptor=encryptor, error_payload=_error_payload(data))
+        data = await _response_json(response)
+        if data is None:
+            raise _invalid_upstream_response_error(response.status)
+        result = SourceResponsesCompletion(
+            payload=data,
+            usage=_usage_from_responses_payload(data),
+            timings=_timings_from_payload(data),
+            upstream_status_code=response.status,
+        )
+        if admission is not None:
+            admission.mark_body_received()
     except (aiohttp.ClientError, TimeoutError) as exc:
+        await _await_cleanup_deferring_cancellation(stack.aclose())
         raise _unreachable_error(exc) from exc
+    except BaseException:
+        await _await_cleanup_deferring_cancellation(stack.aclose())
+        raise
+
+    cleanup_cancelled = await _await_result_deferring_cancellation(stack.aclose())
+    if cleanup_cancelled:
+        raise asyncio.CancelledError
+    return result
 
 
 async def forward_audio_transcription(
@@ -694,6 +758,8 @@ async def _source_stream_body(
                 usage_holder.content_delivered = True
             for pending in withheld:
                 yield pending
+        if usage_holder.terminal_kind not in _FAILURE_TERMINAL_KINDS:
+            transport.mark_body_received()
     finally:
         # A plain ``async with stack`` unwinds unshielded: repeated
         # cancellation delivery can interrupt ``__aexit__`` mid-unwind and
@@ -712,7 +778,7 @@ async def _open_source_stream(
     clock: Clock = REAL_CLOCK,
     header_deadline_seconds: float | None = SOURCE_HEADER_DEADLINE_SECONDS,
     first_frame_deadline_seconds: float | None = SOURCE_FIRST_FRAME_DEADLINE_SECONDS,
-) -> tuple[AsyncExitStack, aiohttp.ClientResponse, bytes | None]:
+) -> tuple[SourceRequestExitStack, aiohttp.ClientResponse, bytes | None]:
     """Open the upstream request eagerly so errors surface before headers.
 
     Streaming callers wrap the returned response in a ``StreamingResponse``;
@@ -737,9 +803,11 @@ async def _open_source_stream(
     chunk, which the body yields before reading further, or ``None`` when the
     body reads it.
     """
-    stack = AsyncExitStack()
+    stack = SourceRequestExitStack()
     opened_at = clock.monotonic()
     try:
+        admission = await stack.enter_async_context(_source_admission(source, payload, encryptor))
+        stack.admission = admission
         session = await stack.enter_async_context(lease_model_source_session())
         try:
             with _phase_deadline(scheduler, header_deadline_seconds):
@@ -762,6 +830,8 @@ async def _open_source_stream(
                 # Only the source's total budget was armed: the pre-hardening verdict.
                 raise _unreachable_error(exc) from exc
             raise _timeout_error("header", source, elapsed=clock.monotonic() - opened_at) from exc
+        if admission is not None:
+            admission.observe_response(response.status, response.headers)
         if response.status >= 400:
             if recode_credential_failures and response.status in _CREDENTIAL_REJECTION_STATUSES:
                 raise _credentials_rejected_error(response, source)
