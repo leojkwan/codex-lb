@@ -21,7 +21,9 @@ cleanup() {
   fi
   rm -rf "$RUN"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 chmod a+rx "$RUN"; mkdir -p "$RUN/sock"; [[ "$(id -u)" != 0 ]] || chown postgres "$RUN" "$RUN/sock"
 as_pg "$PGBIN/initdb" -D "$RUN/data" --username=postgres --auth=trust --no-locale --encoding=UTF8 >/dev/null
 # max_connections is raised because the suite opens many pools.
@@ -31,4 +33,6 @@ create role codex_lb login superuser password 'codex_lb';
 create database codex_lb owner codex_lb;
 SQL
 cd "$ROOT"
-make test-postgres POSTGRES_TEST_DATABASE_URL="postgresql+asyncpg://codex_lb:codex_lb@127.0.0.1:${PORT}/codex_lb" "$@"
+# Force the temporary database even if the caller exported an override.
+DB_URL="postgresql+asyncpg://codex_lb:codex_lb@127.0.0.1:${PORT}/codex_lb"
+CODEX_LB_TEST_DATABASE_URL="$DB_URL" make test-postgres POSTGRES_TEST_DATABASE_URL="$DB_URL" "$@"
