@@ -5,11 +5,22 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PGBIN="$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1 || true)"
-if [[ -z "$PGBIN" ]]; then apt-get install -y postgresql >&2; PGBIN="$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)"; fi
+if [[ -z "$PGBIN" ]]; then
+  [[ "$(id -u)" == 0 ]] || { echo "PostgreSQL is not installed and root is required to install it" >&2; exit 1; }
+  apt-get install -y postgresql >&2
+  PGBIN="$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)"
+fi
 PORT="${CODEX_LB_TEST_PG_PORT:-5432}"
 RUN="$(mktemp -d /tmp/codex-lb-pg.XXXXXX)"
 as_pg() { if [[ "$(id -u)" == 0 ]]; then runuser -u postgres -- "$@"; else "$@"; fi; }
-cleanup() { as_pg "$PGBIN/pg_ctl" -D "$RUN/data" -m fast -w stop >/dev/null 2>&1 || true; rm -rf "$RUN"; }
+cleanup() {
+  if ! as_pg "$PGBIN/pg_ctl" -D "$RUN/data" -m fast -w stop >/dev/null 2>&1 \
+    && ! as_pg "$PGBIN/pg_ctl" -D "$RUN/data" -m immediate -w stop >/dev/null 2>&1; then
+    # Do not delete the data directory under a server that is still running.
+    if [[ -f "$RUN/data/postmaster.pid" ]]; then echo "warning: could not stop temporary PostgreSQL; keeping $RUN" >&2; return; fi
+  fi
+  rm -rf "$RUN"
+}
 trap cleanup EXIT INT TERM
 chmod a+rx "$RUN"; mkdir -p "$RUN/sock"; [[ "$(id -u)" != 0 ]] || chown postgres "$RUN" "$RUN/sock"
 as_pg "$PGBIN/initdb" -D "$RUN/data" --username=postgres --auth=trust --no-locale --encoding=UTF8 >/dev/null
@@ -20,4 +31,4 @@ create role codex_lb login superuser password 'codex_lb';
 create database codex_lb owner codex_lb;
 SQL
 cd "$ROOT"
-make test-postgres "$@"
+make test-postgres POSTGRES_TEST_DATABASE_URL="postgresql+asyncpg://codex_lb:codex_lb@127.0.0.1:${PORT}/codex_lb" "$@"
