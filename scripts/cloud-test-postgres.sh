@@ -4,11 +4,20 @@
 # Makefile defaults to. Usage: scripts/cloud-test-postgres.sh [make args]
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PGBIN="$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1 || true)"
+# Newest installed version that has the server binaries (a client-only install lacks initdb/pg_ctl).
+find_pgbin() {
+  local d
+  for d in $(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -rV); do
+    [[ -x "$d/initdb" && -x "$d/pg_ctl" ]] && { echo "$d"; return; }
+  done
+}
+PGBIN="$(find_pgbin)"
 if [[ -z "$PGBIN" ]]; then
-  [[ "$(id -u)" == 0 ]] || { echo "PostgreSQL is not installed and root is required to install it" >&2; exit 1; }
+  [[ "$(id -u)" == 0 ]] || { echo "PostgreSQL server is not installed and root is required to install it" >&2; exit 1; }
+  apt-get update >&2
   apt-get install -y postgresql >&2
-  PGBIN="$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)"
+  PGBIN="$(find_pgbin)"
+  [[ -n "$PGBIN" ]] || { echo "PostgreSQL install did not provide initdb and pg_ctl" >&2; exit 1; }
 fi
 PORT="${CODEX_LB_TEST_PG_PORT:-5432}"
 RUN="$(mktemp -d /tmp/codex-lb-pg.XXXXXX)"
